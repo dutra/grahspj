@@ -21,6 +21,7 @@ from jaxsedfit.config import (
     OutputConfig,
     PhotometryData,
     RedshiftPriorConfig,
+    SpectroscopyData,
 )
 from jaxsedfit.core import JAXSEDFit, _joint_dense_mass_blocks, _resolve_dense_mass_structure
 from jaxsedfit.model import (
@@ -792,6 +793,10 @@ def test_compact_map_warm_start_preserves_median_and_drops_svi_state(monkeypatch
 def test_fit_nuts_reads_sampler_settings_from_config(monkeypatch):
     captured = {}
 
+    def _fake_prepare_reparameterization(model, init_values, rng_seed, **kwargs):
+        captured["reparameterization_kwargs"] = kwargs
+        return model, init_values, {}
+
     def _fake_nuts(model, **kwargs):
         captured["kernel_kwargs"] = kwargs
         return "kernel"
@@ -823,6 +828,11 @@ def test_fit_nuts_reads_sampler_settings_from_config(monkeypatch):
 
     monkeypatch.setitem(JAXSEDFit.fit_nuts.__globals__, "NUTS", _fake_nuts)
     monkeypatch.setitem(JAXSEDFit.fit_nuts.__globals__, "MCMC", _FakeMCMC)
+    monkeypatch.setitem(
+        JAXSEDFit.fit_nuts.__globals__,
+        "_prepare_nuts_reparameterization",
+        _fake_prepare_reparameterization,
+    )
 
     fitter = JAXSEDFit.__new__(JAXSEDFit)
     fitter.config = _mock_config()
@@ -833,6 +843,13 @@ def test_fit_nuts_reads_sampler_settings_from_config(monkeypatch):
     fitter.config.inference.dense_mass = True
     fitter.config.inference.max_tree_depth = 8
     fitter.config.inference.warmup_max_tree_depth = 11
+    fitter.config.inference.reparameterize_normalizations = False
+    fitter.config.agn.fit_feii = True
+    fitter.config.spectroscopy = SpectroscopyData(
+        wave_obs=[4000.0],
+        fluxes=[1.0],
+        errors=[0.1],
+    )
     fitter.map_result = None
     fitter.predictive = {"stale": True}
     fitter._model = lambda: None
@@ -845,6 +862,10 @@ def test_fit_nuts_reads_sampler_settings_from_config(monkeypatch):
     assert captured["kernel_kwargs"]["max_tree_depth"] == (11, 8)
     assert captured["kernel_kwargs"]["find_heuristic_step_size"] is True
     assert captured["kernel_kwargs"]["init_strategy"] is not None
+    assert captured["reparameterization_kwargs"] == {
+        "reparameterize_additive_pivots": False,
+        "reparameterize_spectral_features": True,
+    }
     assert captured["mcmc_kernel"] == "kernel"
     assert captured["mcmc_kwargs"]["num_warmup"] == 11
     assert captured["mcmc_kwargs"]["num_samples"] == 12

@@ -1548,8 +1548,8 @@ class JAXSEDFit:
             and self.config.spectroscopy is not None
             and bool(self.config.spectroscopy_list)
             and (
-                spectral_config.feii
-                or spectral_config.balmer_continuum
+                spectral_config.fit_feii
+                or spectral_config.fit_balmer_continuum
             )
         )
         if (
