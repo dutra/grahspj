@@ -12,6 +12,7 @@ from jaxsedfit.config import (
     GalaxyConfig,
     Observation,
     PhotometryData,
+    fit_config_from_mapping,
 )
 from jaxsedfit.core import JAXSEDFit
 from jaxsedfit.results import FitResult, PredictionResult
@@ -47,6 +48,18 @@ def _minimal_config() -> FitConfig:
         ),
         galaxy=GalaxyConfig(dsps_ssp_fn="fake.h5", n_wave=32, sfh_n_steps=8),
     )
+
+
+def test_host_capture_group_config_roundtrip_and_legacy_compatibility():
+    cfg = _minimal_config()
+    cfg.photometry.host_capture_group = ["survey-psf"]
+    restored = fit_config_from_mapping(cfg.to_dict())
+    assert restored.photometry.host_capture_group == ["survey-psf"]
+
+    legacy_mapping = cfg.to_dict()
+    legacy_mapping["photometry"].pop("host_capture_group")
+    legacy = fit_config_from_mapping(legacy_mapping)
+    assert legacy.photometry.host_capture_group is None
 
 
 def test_prediction_result_labels_line_components_and_groups():

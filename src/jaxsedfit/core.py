@@ -3,7 +3,7 @@ from __future__ import annotations
 import gc
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import h5py
 import jax
@@ -648,6 +648,9 @@ class JAXSEDFit:
         *,
         kind: str,
         rng_key: Any,
+        component_rest_wavelengths: np.ndarray | None = None,
+        component_host_capture_group_index: int | None = None,
+        component_psf_fwhm_arcsec: np.ndarray | None = None,
     ) -> dict[str, np.ndarray]:
         """Evaluate posterior predictions one draw at a time.
 
@@ -669,8 +672,14 @@ class JAXSEDFit:
             self.context,
             include_components=include_components,
             force_component_fluxes=(kind == "photometry"),
+            component_rest_wavelengths=component_rest_wavelengths,
+            component_host_capture_group_index=component_host_capture_group_index,
+            component_psf_fwhm_arcsec=component_psf_fwhm_arcsec,
         )
-        return_sites = self._predictive_return_sites(kind)
+        return_sites = self._predictive_return_sites(
+            kind,
+            include_component_request=component_rest_wavelengths is not None,
+        )
         streamed: dict[str, np.ndarray] | None = None
 
         for draw_index, draw_rng_key in enumerate(rng_keys):
@@ -718,7 +727,11 @@ class JAXSEDFit:
         return {} if streamed is None else streamed
 
     @staticmethod
-    def _predictive_return_sites(kind: str) -> list[str]:
+    def _predictive_return_sites(
+        kind: str,
+        *,
+        include_component_request: bool = False,
+    ) -> list[str]:
         """Return deterministic sites needed for a prediction product set.
 
         Parameters
@@ -809,13 +822,27 @@ class JAXSEDFit:
             "extended_capture_source_fluxes",
             "captured_extended_source_fluxes",
             "host_capture_fraction_fluxes",
+            "host_capture_group_fraction_fit",
             "log_host_capture_scale_arcsec_fit",
             "host_capture_slope_fit",
             "transmitted_fraction_fluxes",
         ]
+        component_sites = (
+            [
+                "component_rest_wavelengths",
+                "component_agn_rest_flux",
+                "component_host_rest_flux",
+                "component_host_capture_fraction",
+                "component_host_captured_rest_flux",
+                "component_total_captured_rest_flux",
+                "component_host_fraction",
+            ]
+            if include_component_request
+            else []
+        )
         if kind == "photometry":
-            return photometry_sites
-        return photometry_sites + [
+            return photometry_sites + component_sites
+        return photometry_sites + component_sites + [
             "agn_fluxes",
             "host_fluxes",
             "dust_fluxes",
@@ -879,6 +906,97 @@ class JAXSEDFit:
             "balmer_obs_sed",
         ]
 
+    def _normalize_component_request(
+        self,
+        *,
+        rest_wavelengths: Sequence[float] | np.ndarray | None,
+        host_capture_group: str | None,
+        psf_fwhm_arcsec: float | Sequence[float] | np.ndarray | None,
+    ) -> tuple[
+        np.ndarray | None,
+        int | None,
+        np.ndarray | None,
+        tuple[Any, ...] | None,
+    ]:
+        """Validate and canonicalize a monochromatic component request."""
+        if rest_wavelengths is None:
+            if host_capture_group is not None or psf_fwhm_arcsec is not None:
+                raise ValueError(
+                    "A host-capture group or PSF FWHM requires "
+                    "component_rest_wavelengths."
+                )
+            return None, None, None, None
+
+        wavelengths = np.asarray(rest_wavelengths, dtype=float)
+        if wavelengths.ndim == 0:
+            wavelengths = wavelengths.reshape(1)
+        if wavelengths.ndim != 1 or wavelengths.size == 0:
+            raise ValueError(
+                "component_rest_wavelengths must be a nonempty scalar or "
+                "one-dimensional sequence."
+            )
+        if not np.all(np.isfinite(wavelengths)) or np.any(wavelengths <= 0.0):
+            raise ValueError(
+                "component_rest_wavelengths must contain only positive finite "
+                "rest-frame wavelengths in Angstrom."
+            )
+        rest_min = float(self.config.galaxy.rest_wave_min)
+        rest_max = float(self.config.galaxy.rest_wave_max)
+        if np.any(wavelengths < rest_min) or np.any(wavelengths > rest_max):
+            raise ValueError(
+                "component_rest_wavelengths must lie within the configured "
+                f"rest-frame grid [{rest_min:g}, {rest_max:g}] Angstrom."
+            )
+
+        has_group = host_capture_group is not None
+        has_fwhm = psf_fwhm_arcsec is not None
+        if has_group == has_fwhm:
+            raise ValueError(
+                "Specify exactly one of component_host_capture_group or "
+                "component_psf_fwhm_arcsec for a component request."
+            )
+
+        if has_group:
+            group = str(host_capture_group).strip()
+            if not group:
+                raise ValueError("component_host_capture_group cannot be empty.")
+            try:
+                group_index = self.context.host_capture_group_names.index(group)
+            except ValueError as exc:
+                available = ", ".join(self.context.host_capture_group_names) or "none"
+                raise ValueError(
+                    f"Unknown host-capture group {group!r}; available groups: "
+                    f"{available}."
+                ) from exc
+            cache_key = (
+                tuple(float(value) for value in wavelengths),
+                "group",
+                group,
+            )
+            return wavelengths, int(group_index), None, cache_key
+
+        fwhm = np.asarray(psf_fwhm_arcsec, dtype=float)
+        if fwhm.ndim == 0:
+            fwhm = np.full(wavelengths.shape, float(fwhm), dtype=float)
+        elif fwhm.ndim == 1 and fwhm.size == wavelengths.size:
+            fwhm = np.asarray(fwhm, dtype=float)
+        else:
+            raise ValueError(
+                "component_psf_fwhm_arcsec must be a positive scalar or a "
+                "one-dimensional sequence matching component_rest_wavelengths."
+            )
+        if not np.all(np.isfinite(fwhm)) or np.any(fwhm <= 0.0):
+            raise ValueError(
+                "component_psf_fwhm_arcsec must contain only positive finite "
+                "values."
+            )
+        cache_key = (
+            tuple(float(value) for value in wavelengths),
+            "psf_fwhm_arcsec",
+            tuple(float(value) for value in fwhm),
+        )
+        return wavelengths, None, fwhm, cache_key
+
     def _make_result(
         self,
         *,
@@ -938,6 +1056,9 @@ class JAXSEDFit:
         max_draws: int | None = None,
         posterior_samples: Mapping[str, Any] | None = None,
         cache: bool = True,
+        component_rest_wavelengths: Sequence[float] | np.ndarray | None = None,
+        component_host_capture_group: str | None = None,
+        component_psf_fwhm_arcsec: float | Sequence[float] | np.ndarray | None = None,
     ) -> dict[str, Any]:
         """Generate and cache predictive outputs from posterior samples.
 
@@ -956,10 +1077,22 @@ class JAXSEDFit:
         """
         state = self._ensure_fit_state() if _state is None else _state
         kind = self._prediction_kind(kind)
+        (
+            component_wavelengths,
+            component_group_index,
+            component_fwhm,
+            component_cache_key,
+        ) = self._normalize_component_request(
+            rest_wavelengths=component_rest_wavelengths,
+            host_capture_group=component_host_capture_group,
+            psf_fwhm_arcsec=component_psf_fwhm_arcsec,
+        )
         samples = state.samples if posterior_samples is None else posterior_samples
         if samples is None:
             raise RuntimeError("No fitted posterior available. Run fit_map(), fit_nuts(), or fit_ns() first.")
         cache_key = f"{kind}:{'all' if max_draws is None else int(max_draws)}"
+        if component_cache_key is not None:
+            cache_key = f"{cache_key}:components={component_cache_key!r}"
         if cache and posterior_samples is None and state.predictive_cache is not None and cache_key in state.predictive_cache:
             return dict(state.predictive_cache[cache_key])
         draw_samples = self._subset_prediction_samples(samples, max_draws)
@@ -968,12 +1101,19 @@ class JAXSEDFit:
             draw_samples,
             kind=kind,
             rng_key=rng_key,
+            component_rest_wavelengths=component_wavelengths,
+            component_host_capture_group_index=component_group_index,
+            component_psf_fwhm_arcsec=component_fwhm,
         )
         if cache and posterior_samples is None:
             if state.predictive_cache is None:
                 state.predictive_cache = {}
             state.predictive_cache[cache_key] = predictive
-            if kind == "plot" and max_draws is None:
+            if (
+                kind == "plot"
+                and max_draws is None
+                and component_wavelengths is None
+            ):
                 state.predictive = predictive
         return predictive
 
@@ -1668,6 +1808,9 @@ class JAXSEDFit:
         *,
         kind: str = "plot",
         max_draws: int | None = None,
+        component_rest_wavelengths: Sequence[float] | np.ndarray | None = None,
+        component_host_capture_group: str | None = None,
+        component_psf_fwhm_arcsec: float | Sequence[float] | np.ndarray | None = None,
         _state: _FitState | None = None,
     ) -> dict[str, Any]:
         """Return cached predictive outputs or generate them on demand.
@@ -1687,6 +1830,14 @@ class JAXSEDFit:
         max_draws : int, optional
             Maximum number of posterior draws to evaluate. If omitted, all
             available draws are used.
+        component_rest_wavelengths : sequence of float, optional
+            Rest-frame wavelengths in Angstrom at which to return direct
+            component draws.
+        component_host_capture_group : str, optional
+            Named shared host-capture group to apply to the requested host
+            component. Mutually exclusive with ``component_psf_fwhm_arcsec``.
+        component_psf_fwhm_arcsec : float or sequence of float, optional
+            PSF FWHM used to predict host capture at each requested wavelength.
         _state : _FitState, optional
             Internal fit-state override used by :class:`FitResult`.
 
@@ -1697,17 +1848,57 @@ class JAXSEDFit:
         """
         state = self._ensure_fit_state() if _state is None else _state
         kind = self._prediction_kind(kind)
-        if kind == "plot" and max_draws is None and state.predictive is not None:
+        has_component_request = component_rest_wavelengths is not None
+        if (
+            kind == "plot"
+            and max_draws is None
+            and not has_component_request
+            and state.predictive is not None
+        ):
             return dict(state.predictive)
-        if kind == "plot" and max_draws is None and state is self._ensure_fit_state():
+        if (
+            kind == "plot"
+            and max_draws is None
+            and not has_component_request
+            and state is self._ensure_fit_state()
+        ):
             return self._compute_predictive()
-        return self._compute_predictive(_state=state, kind=kind, max_draws=max_draws)
+        return self._compute_predictive(
+            _state=state,
+            kind=kind,
+            max_draws=max_draws,
+            component_rest_wavelengths=component_rest_wavelengths,
+            component_host_capture_group=component_host_capture_group,
+            component_psf_fwhm_arcsec=component_psf_fwhm_arcsec,
+        )
+
+    def predict_components(
+        self,
+        rest_wavelengths: Sequence[float] | np.ndarray,
+        *,
+        host_capture_group: str | None = None,
+        psf_fwhm_arcsec: float | Sequence[float] | np.ndarray | None = None,
+        max_draws: int | None = None,
+        _state: _FitState | None = None,
+    ) -> dict[str, Any]:
+        """Return lightweight monochromatic posterior component draws."""
+        return self.predict(
+            kind="photometry",
+            max_draws=max_draws,
+            component_rest_wavelengths=rest_wavelengths,
+            component_host_capture_group=host_capture_group,
+            component_psf_fwhm_arcsec=psf_fwhm_arcsec,
+            _state=_state,
+        )
 
     def predict_median(
         self,
         posterior: str = "latest",
         *,
         kind: str = "plot",
+        component_rest_wavelengths: Sequence[float] | np.ndarray | None = None,
+        component_host_capture_group: str | None = None,
+        component_psf_fwhm_arcsec: float | Sequence[float] | np.ndarray | None = None,
         _state: _FitState | None = None,
     ) -> dict[str, Any]:
         """Evaluate predictive products once at the posterior median parameters.
@@ -1736,6 +1927,9 @@ class JAXSEDFit:
             kind=kind,
             posterior_samples=median_samples,
             cache=False,
+            component_rest_wavelengths=component_rest_wavelengths,
+            component_host_capture_group=component_host_capture_group,
+            component_psf_fwhm_arcsec=component_psf_fwhm_arcsec,
         )
 
     def spectral_line_metadata(self) -> dict[str, Any]:

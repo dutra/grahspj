@@ -284,6 +284,8 @@ class ModelContext:
     positive_detected_mask: np.ndarray
     effective_spatial_scale_arcsec: np.ndarray
     photometry_total_capture: np.ndarray
+    host_capture_group_codes: np.ndarray
+    host_capture_group_names: tuple[str, ...]
     spec_wave_obs: np.ndarray
     spec_fluxes: np.ndarray
     spec_errors: np.ndarray
@@ -1970,6 +1972,32 @@ def build_model_context(cfg: FitConfig) -> ModelContext:
         photometry_methods,
         ("profile", "auto", "model", "cmodel", "petrosian"),
     )
+    host_capture_groups = list(
+        photometry.host_capture_group
+        if photometry.host_capture_group is not None
+        else [None] * len(fluxes)
+    )
+    host_capture_group_names = tuple(
+        dict.fromkeys(group for group in host_capture_groups if group is not None)
+    )
+    host_capture_group_lookup = {
+        name: index for index, name in enumerate(host_capture_group_names)
+    }
+    host_capture_group_codes = np.asarray(
+        [host_capture_group_lookup.get(group, -1) for group in host_capture_groups],
+        dtype=int,
+    )
+    grouped = host_capture_group_codes >= 0
+    has_physical_scale = np.isfinite(effective_spatial_scale_arcsec) & (
+        effective_spatial_scale_arcsec > 0.0
+    )
+    invalid_grouped = grouped & (photometry_total_capture | has_physical_scale)
+    if np.any(invalid_grouped):
+        indices = np.flatnonzero(invalid_grouped).tolist()
+        raise ValueError(
+            "host_capture_group is only valid for non-total photometry without "
+            f"a physical PSF/aperture scale; invalid row indices: {indices}."
+        )
     fluxes = np.nan_to_num(fluxes, nan=0.0, posinf=1.0e30, neginf=-1.0e30)
     errors = np.nan_to_num(errors, nan=1.0e30, posinf=1.0e30, neginf=1.0e30)
     errors = np.clip(np.abs(errors), 1.0e-30, 1.0e30)
@@ -2246,6 +2274,8 @@ def build_model_context(cfg: FitConfig) -> ModelContext:
         positive_detected_mask=positive_detected_mask,
         effective_spatial_scale_arcsec=np.asarray(effective_spatial_scale_arcsec, dtype=float),
         photometry_total_capture=np.asarray(photometry_total_capture, dtype=bool),
+        host_capture_group_codes=host_capture_group_codes,
+        host_capture_group_names=host_capture_group_names,
         spec_wave_obs=np.asarray(spec_wave_obs, dtype=float),
         spec_fluxes=np.asarray(spec_fluxes, dtype=float),
         spec_errors=np.asarray(spec_errors, dtype=float),

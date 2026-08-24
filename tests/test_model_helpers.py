@@ -177,6 +177,26 @@ def test_photometry_method_is_normalized_metadata_only():
         bad.validate()
 
 
+def test_host_capture_group_normalization_and_length_validation():
+    phot = PhotometryData(
+        filter_names=["u", "g", "r"],
+        fluxes=[1.0, 2.0, 3.0],
+        errors=[0.1, 0.1, 0.1],
+        host_capture_group=[" shared-psf ", "", None],
+    )
+    phot.validate()
+    assert phot.host_capture_group == ["shared-psf", None, None]
+
+    bad = PhotometryData(
+        filter_names=["u", "g"],
+        fluxes=[1.0, 2.0],
+        errors=[0.1, 0.1],
+        host_capture_group=["shared-psf"],
+    )
+    with pytest.raises(ValueError, match="host_capture_group must match"):
+        bad.validate()
+
+
 def test_total_flux_photometry_bypasses_host_capture_scale(monkeypatch):
     class _SSPData:
         ssp_lgmet = np.array([-1.0, 0.0])

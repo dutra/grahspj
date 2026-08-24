@@ -699,6 +699,71 @@ def test_psf_photometry_without_scale_infers_independent_host_capture(monkeypatc
     )
 
 
+def test_missing_scale_photometry_can_share_host_capture_group(monkeypatch):
+    _patch_ssp(monkeypatch)
+    cfg = _cfg(fit_agn=False)
+    cfg.photometry = PhotometryData(
+        filter_names=["f1", "f2", "f3"],
+        fluxes=[1.0, 1.0, 1.0],
+        errors=[0.1, 0.1, 0.1],
+        photometry_method=["psf", "psf", "psf"],
+        host_capture_group=["survey-psf", "survey-psf", None],
+    )
+    cfg.filters = FilterSet(
+        curves=[
+            FilterCurve(
+                name=name,
+                wave=[1500.0, 2000.0, 2500.0],
+                transmission=[0.0, 1.0, 0.0],
+            )
+            for name in ("f1", "f2", "f3")
+        ]
+    )
+    cfg.likelihood.use_host_capture_model = True
+    context = build_model_context(cfg)
+    assert context.host_capture_group_names == ("survey-psf",)
+    assert context.host_capture_group_codes.tolist() == [0, 0, -1]
+
+    tr = _deterministic_trace(
+        context,
+        {
+            "host_capture_group_fraction": np.array([0.4]),
+            "missing_psf_host_capture_fraction": np.array([0.7]),
+            "log_ebv_gal": _log_positive(0.5),
+            "dust_alpha": np.array(2.0),
+        },
+    )
+    np.testing.assert_allclose(
+        _site(tr, "host_capture_fraction_fluxes"), [0.4, 0.4, 0.7]
+    )
+    np.testing.assert_allclose(
+        _site(tr, "host_capture_group_fraction_fit"), [0.4]
+    )
+
+
+@pytest.mark.parametrize(
+    "photometry_kwargs",
+    [
+        {"photometry_method": ["profile"]},
+        {"photometry_method": ["psf"], "psf_fwhm_arcsec": [1.2]},
+    ],
+)
+def test_host_capture_group_rejects_total_or_known_scale_rows(
+    monkeypatch, photometry_kwargs
+):
+    _patch_ssp(monkeypatch)
+    cfg = _cfg()
+    cfg.photometry = PhotometryData(
+        filter_names=["f1"],
+        fluxes=[1.0],
+        errors=[0.1],
+        host_capture_group=["survey-psf"],
+        **photometry_kwargs,
+    )
+    with pytest.raises(ValueError, match="only valid for non-total photometry"):
+        build_model_context(cfg)
+
+
 def test_agn_off_mode_has_zero_agn_components_and_no_total_leak(monkeypatch):
     _patch_ssp(monkeypatch)
     context = build_model_context(_cfg(fit_agn=False))
@@ -1147,6 +1212,143 @@ def test_predict_supports_lightweight_and_median_modes(monkeypatch):
     assert "total_obs_sed" in full
     assert full["pred_fluxes"].shape[0] == 1
     assert median["pred_fluxes"].shape[0] == 1
+
+
+def test_predict_components_returns_direct_group_captured_draws(monkeypatch):
+    _patch_ssp(monkeypatch)
+    cfg = _cfg(n_wave=128)
+    cfg.photometry.host_capture_group = ["survey-psf"]
+    cfg.photometry.photometry_method = ["psf"]
+    cfg.likelihood.use_host_capture_model = True
+    cfg.likelihood.use_fast_photometry_projection = True
+    cfg.likelihood.use_local_line_photometry = False
+    fitter = JAXSEDFit(cfg)
+    init_trace = trace(
+        seed(
+            lambda: grahsp_photometric_model(
+                fitter.context, include_components=False
+            ),
+            0,
+        )
+    ).get_trace()
+    fitter.samples = {
+        name: np.repeat(np.asarray(site["value"])[None, ...], 2, axis=0)
+        for name, site in init_trace.items()
+        if site.get("type") == "sample" and not site.get("is_observed", False)
+    }
+
+    components = fitter.predict_components(
+        [1800.0, 2500.0], host_capture_group="survey-psf"
+    )
+    assert components["component_host_fraction"].shape == (2, 2)
+    np.testing.assert_allclose(
+        components["component_host_capture_fraction"],
+        np.broadcast_to(
+            fitter.samples["host_capture_group_fraction"], (2, 2)
+        ),
+    )
+    np.testing.assert_allclose(
+        components["component_total_captured_rest_flux"],
+        components["component_agn_rest_flux"]
+        + components["component_host_captured_rest_flux"],
+    )
+    np.testing.assert_allclose(
+        components["component_host_fraction"],
+        components["component_host_captured_rest_flux"]
+        / components["component_total_captured_rest_flux"],
+    )
+
+    psf_components = fitter.predict_components(
+        [2500.0], psf_fwhm_arcsec=1.4
+    )
+    effective_radius = np.sqrt(2.0) * 1.4 / 2.354820045
+    scale = np.exp(fitter.samples["log_host_capture_scale_arcsec"][:, None])
+    expected_capture = effective_radius**2 / (effective_radius**2 + scale**2)
+    np.testing.assert_allclose(
+        psf_components["component_host_capture_fraction"], expected_capture
+    )
+
+
+def test_component_prediction_survives_posterior_bundle_roundtrip(
+    monkeypatch, tmp_path
+):
+    _patch_ssp(monkeypatch)
+    cfg = _cfg(n_wave=64)
+    cfg.photometry.host_capture_group = ["survey-psf"]
+    cfg.photometry.photometry_method = ["psf"]
+    cfg.likelihood.use_host_capture_model = True
+    cfg.likelihood.use_fast_photometry_projection = True
+    cfg.likelihood.use_local_line_photometry = False
+    fitter = JAXSEDFit(cfg)
+    init_trace = trace(
+        seed(
+            lambda: grahsp_photometric_model(
+                fitter.context, include_components=False
+            ),
+            0,
+        )
+    ).get_trace()
+    fitter.samples = {
+        name: np.repeat(np.asarray(site["value"])[None, ...], 2, axis=0)
+        for name, site in init_trace.items()
+        if site.get("type") == "sample" and not site.get("is_observed", False)
+    }
+    before = fitter.predict_components(
+        [2500.0], host_capture_group="survey-psf"
+    )
+    loaded = JAXSEDFit.load(fitter.save(tmp_path))
+    after = loaded.predict_components(
+        [2500.0], host_capture_group="survey-psf"
+    )
+
+    assert loaded.config.photometry.host_capture_group == ["survey-psf"]
+    for name in (
+        "component_agn_rest_flux",
+        "component_host_rest_flux",
+        "component_host_capture_fraction",
+        "component_host_fraction",
+    ):
+        np.testing.assert_allclose(after[name], before[name])
+
+
+def test_component_request_validation_and_cache_key(monkeypatch):
+    _patch_ssp(monkeypatch)
+    cfg = _cfg(n_wave=64)
+    cfg.photometry.host_capture_group = ["survey-psf"]
+    cfg.photometry.photometry_method = ["psf"]
+    cfg.likelihood.use_host_capture_model = True
+    fitter = JAXSEDFit(cfg)
+
+    with pytest.raises(ValueError, match="exactly one"):
+        fitter._normalize_component_request(
+            rest_wavelengths=[2500.0],
+            host_capture_group=None,
+            psf_fwhm_arcsec=None,
+        )
+    with pytest.raises(ValueError, match="Unknown host-capture group"):
+        fitter._normalize_component_request(
+            rest_wavelengths=[2500.0],
+            host_capture_group="missing",
+            psf_fwhm_arcsec=None,
+        )
+    with pytest.raises(ValueError, match="configured rest-frame grid"):
+        fitter._normalize_component_request(
+            rest_wavelengths=[10.0],
+            host_capture_group="survey-psf",
+            psf_fwhm_arcsec=None,
+        )
+
+    group_request = fitter._normalize_component_request(
+        rest_wavelengths=[2500.0],
+        host_capture_group="survey-psf",
+        psf_fwhm_arcsec=None,
+    )
+    psf_request = fitter._normalize_component_request(
+        rest_wavelengths=[2500.0],
+        host_capture_group=None,
+        psf_fwhm_arcsec=1.4,
+    )
+    assert group_request[-1] != psf_request[-1]
 
 
 def test_local_line_photometry_improves_coarse_grid_line_projection(monkeypatch):

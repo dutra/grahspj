@@ -3594,6 +3594,9 @@ def evaluate_photometric_state(
     return_state: bool = True,
     force_component_fluxes: bool = False,
     include_spectral_lines: bool = True,
+    component_rest_wavelengths=None,
+    component_host_capture_group_index: int | None = None,
+    component_psf_fwhm_arcsec=None,
 ):
     """Evaluate one jaxsedfit photometric model state inside a NumPyro trace.
 
@@ -3645,6 +3648,10 @@ def evaluate_photometric_state(
     fit_agn = bool(cfg.agn.fit_agn)
     spatial_scale_arcsec = _np_to_jnp(context.effective_spatial_scale_arcsec)
     photometry_total_capture = _bool_to_jnp(context.photometry_total_capture)
+    host_capture_group_codes = jnp.asarray(
+        context.host_capture_group_codes, dtype=jnp.int32
+    )
+    n_host_capture_groups = len(context.host_capture_group_names)
     spectroscopy_enabled = bool(
         cfg.spectroscopy is not None
         and bool(cfg.spectroscopy_list)
@@ -3685,7 +3692,21 @@ def evaluate_photometric_state(
             & (np.asarray(context.effective_spatial_scale_arcsec, dtype=float) > 0.0)
         )
     )
-    has_missing_partial_photometry_scale = bool(np.any(missing_partial_photometry_scale))
+    has_missing_partial_photometry_scale = bool(
+        np.any(missing_partial_photometry_scale)
+    )
+    host_capture_group_codes_np = np.asarray(
+        context.host_capture_group_codes, dtype=int
+    )
+    grouped_missing_photometry_scale = (
+        missing_partial_photometry_scale & (host_capture_group_codes_np >= 0)
+    )
+    ungrouped_missing_photometry_scale = (
+        missing_partial_photometry_scale & (host_capture_group_codes_np < 0)
+    )
+    has_ungrouped_missing_photometry_scale = bool(
+        np.any(ungrouped_missing_photometry_scale)
+    )
     has_spec_spatial_scale = bool(
         spectroscopy_enabled
         and np.any(np.isfinite(context.spec_effective_spatial_scale_arcsec) & (np.asarray(context.spec_effective_spatial_scale_arcsec, dtype=float) > 0.0))
@@ -3704,6 +3725,7 @@ def evaluate_photometric_state(
         and include_sed_agn_features
         and cfg.likelihood.use_local_line_photometry
         and not include_components
+        and component_rest_wavelengths is None
         and not spectroscopy_enabled
         and not cfg.likelihood.attenuation_model_uncertainty
     )
@@ -3713,6 +3735,7 @@ def evaluate_photometric_state(
         and cfg.nebular.emission
         and cfg.likelihood.use_local_line_photometry
         and not include_components
+        and component_rest_wavelengths is None
         and not spectroscopy_enabled
         and not cfg.likelihood.attenuation_model_uncertainty
     )
@@ -4410,8 +4433,10 @@ def evaluate_photometric_state(
             jnp.exp(log_host_capture_scale_arcsec),
         )
         phot_scale_valid = jnp.isfinite(spatial_scale_arcsec) & (spatial_scale_arcsec > 0.0)
-        if has_missing_partial_photometry_scale:
-            missing_indices = np.flatnonzero(missing_partial_photometry_scale)
+        if has_ungrouped_missing_photometry_scale:
+            missing_indices = np.flatnonzero(
+                ungrouped_missing_photometry_scale
+            )
             missing_psf_capture_values = numpyro.sample(
                 "missing_psf_host_capture_fraction",
                 dist.Uniform(0.0, 1.0)
@@ -4423,6 +4448,23 @@ def evaluate_photometric_state(
             ].set(missing_psf_capture_values)
         else:
             missing_psf_capture = jnp.ones_like(phot_capture_raw)
+        if n_host_capture_groups:
+            host_capture_group_fraction = numpyro.sample(
+                "host_capture_group_fraction",
+                dist.Uniform(0.0, 1.0)
+                .expand((n_host_capture_groups,))
+                .to_event(1),
+            )
+            grouped_indices = np.flatnonzero(grouped_missing_photometry_scale)
+            if grouped_indices.size:
+                grouped_codes = host_capture_group_codes[
+                    jnp.asarray(grouped_indices, dtype=jnp.int32)
+                ]
+                missing_psf_capture = missing_psf_capture.at[
+                    jnp.asarray(grouped_indices, dtype=jnp.int32)
+                ].set(host_capture_group_fraction[grouped_codes])
+        else:
+            host_capture_group_fraction = jnp.empty((0,), dtype=jnp.float64)
         host_capture_fraction = jnp.where(
             photometry_total_capture,
             1.0,
@@ -4439,6 +4481,53 @@ def evaluate_photometric_state(
         host_capture_slope = jnp.asarray(2.0, dtype=jnp.float64)
         host_capture_fraction = jnp.ones_like(pred_fluxes_raw)
         spec_host_capture_fraction_by_spectrum = jnp.ones_like(spec_spatial_scale_arcsec)
+        host_capture_group_fraction = jnp.ones(
+            (n_host_capture_groups,), dtype=jnp.float64
+        )
+
+    if component_rest_wavelengths is not None:
+        requested_wave = jnp.asarray(component_rest_wavelengths, dtype=jnp.float64)
+        component_agn = jnp.interp(requested_wave, rest_wave, agn_rest)
+        component_host = jnp.interp(
+            requested_wave, rest_wave, gal_att_rest + dust_rest
+        )
+        if component_host_capture_group_index is not None:
+            component_capture = jnp.full_like(
+                requested_wave,
+                host_capture_group_fraction[int(component_host_capture_group_index)],
+            )
+        elif component_psf_fwhm_arcsec is not None:
+            fwhm = jnp.asarray(component_psf_fwhm_arcsec, dtype=jnp.float64)
+            fwhm = jnp.broadcast_to(fwhm, requested_wave.shape)
+            effective_radius = jnp.sqrt(2.0) * fwhm / 2.354820045
+            component_capture = _host_capture_fraction(
+                effective_radius,
+                jnp.exp(log_host_capture_scale_arcsec),
+            )
+        else:
+            component_capture = jnp.ones_like(requested_wave)
+        component_host_captured = component_capture * component_host
+        component_total_captured = component_agn + component_host_captured
+        component_host_fraction = jnp.where(
+            component_total_captured > 0.0,
+            component_host_captured / component_total_captured,
+            jnp.nan,
+        )
+        numpyro.deterministic("component_rest_wavelengths", requested_wave)
+        numpyro.deterministic("component_agn_rest_flux", component_agn)
+        numpyro.deterministic("component_host_rest_flux", component_host)
+        numpyro.deterministic(
+            "component_host_capture_fraction", component_capture
+        )
+        numpyro.deterministic(
+            "component_host_captured_rest_flux", component_host_captured
+        )
+        numpyro.deterministic(
+            "component_total_captured_rest_flux", component_total_captured
+        )
+        numpyro.deterministic(
+            "component_host_fraction", component_host_fraction
+        )
     host_capture_source_fluxes = host_fluxes_total + host_dust_fluxes_total
     agn_narrow_line_fluxes_total = jnp.zeros_like(pred_fluxes_raw)
     if host_capture_enabled and fit_agn and include_sed_agn_features:
@@ -5196,6 +5285,9 @@ def evaluate_photometric_state(
     numpyro.deterministic("extended_capture_source_fluxes", extended_capture_source_fluxes)
     numpyro.deterministic("captured_extended_source_fluxes", captured_extended_source_fluxes)
     numpyro.deterministic("host_capture_fraction_fluxes", host_capture_fraction)
+    numpyro.deterministic(
+        "host_capture_group_fraction_fit", host_capture_group_fraction
+    )
     numpyro.deterministic("log_host_capture_scale_arcsec_fit", log_host_capture_scale_arcsec)
     numpyro.deterministic("host_capture_slope_fit", host_capture_slope)
     numpyro.deterministic("formed_stellar_mass", host_state["formed_mass"])
@@ -5371,6 +5463,9 @@ def grahsp_photometric_model(
     include_spectral_features: bool = True,
     include_spectral_lines: bool = True,
     force_component_fluxes: bool = False,
+    component_rest_wavelengths=None,
+    component_host_capture_group_index: int | None = None,
+    component_psf_fwhm_arcsec=None,
 ):
     """NumPyro model for one jaxsedfit photometric fit or predictive expansion.
 
@@ -5397,6 +5492,9 @@ def grahsp_photometric_model(
         include_spectral_features=include_spectral_features,
         include_spectral_lines=include_spectral_lines,
         force_component_fluxes=force_component_fluxes,
+        component_rest_wavelengths=component_rest_wavelengths,
+        component_host_capture_group_index=component_host_capture_group_index,
+        component_psf_fwhm_arcsec=component_psf_fwhm_arcsec,
         add_likelihood=True,
         return_state=False,
     )

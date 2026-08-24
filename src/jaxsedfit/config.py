@@ -50,8 +50,10 @@ class PhotometryData:
     measurements and receive the full host model. ``psf``, ``aperture``, and
     ``fiber`` measurements use their PSF/aperture scale to estimate captured
     host light. If a non-total measurement has no usable spatial scale, the
-    model infers an independent host-capture fraction on ``[0, 1]`` instead of
-    assuming total host capture. ``catalog``, ``unknown``, and missing labels
+    model infers a host-capture fraction on ``[0, 1]`` instead of assuming total
+    host capture. Missing-scale measurements with the same nonempty
+    ``host_capture_group`` share one fraction; ungrouped measurements retain
+    independent fractions. ``catalog``, ``unknown``, and missing labels
     use the same scale-based behavior when a spatial scale is supplied. Use ``psf`` for point-source/PSF-like
     measurements, ``profile`` for profile-fit photometry, ``aperture`` for
     explicit fixed apertures, ``auto`` for Kron/AUTO-like photometry,
@@ -65,6 +67,7 @@ class PhotometryData:
     psf_fwhm_arcsec: Sequence[float | None] | None = None
     aperture_diameter_arcsec: Sequence[float | None] | None = None
     photometry_method: Sequence[str | None] | None = None
+    host_capture_group: Sequence[str | None] | None = None
 
     def validate(self) -> None:
         """Validate array lengths for one photometry payload."""
@@ -79,6 +82,8 @@ class PhotometryData:
             raise ValueError("aperture_diameter_arcsec must match filter_names length.")
         if self.photometry_method is not None and len(self.photometry_method) != n:
             raise ValueError("photometry_method must match filter_names length.")
+        if self.host_capture_group is not None and len(self.host_capture_group) != n:
+            raise ValueError("host_capture_group must match filter_names length.")
         if self.photometry_method is not None:
             allowed_methods = {
                 "aperture",
@@ -103,6 +108,15 @@ class PhotometryData:
                     raise ValueError(f"Unknown photometry_method '{method}'. Allowed metadata labels: {allowed}.")
                 normalized_methods.append(normalized)
             self.photometry_method = normalized_methods
+        if self.host_capture_group is not None:
+            normalized_groups: list[str | None] = []
+            for group in self.host_capture_group:
+                if group is None:
+                    normalized_groups.append(None)
+                    continue
+                normalized = str(group).strip()
+                normalized_groups.append(normalized or None)
+            self.host_capture_group = normalized_groups
 
 
 @dataclass

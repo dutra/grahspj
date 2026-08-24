@@ -138,6 +138,15 @@ class FitResult:
             kwargs.setdefault("_state", self._state)
         return PredictionResult(self.fitter.predict(**kwargs), fitter=self.fitter)
 
+    def predict_components(self, rest_wavelengths, **kwargs) -> PredictionResult:
+        """Return lightweight monochromatic posterior component draws."""
+        if self._state is not None:
+            kwargs.setdefault("_state", self._state)
+        return PredictionResult(
+            self.fitter.predict_components(rest_wavelengths, **kwargs),
+            fitter=self.fitter,
+        )
+
     @property
     def spectrum(self) -> SpectralResult:
         """Typed, unit-explicit posterior spectral result."""
